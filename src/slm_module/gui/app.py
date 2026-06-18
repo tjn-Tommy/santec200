@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import threading
 import traceback
 from pathlib import Path
@@ -12,7 +13,18 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from osa_module.controller import MeasurementSettings, OSAController
+
 from ..calibration import CalibrationFit, fit_calibration, load_calibration_csv
+from ..calibration.calibration_new import (
+    CalibrationAborted,
+    CalibrationProgress,
+    CalibrationResult,
+    find_min_max_intensity_levels,
+    intensity_calibration,
+    wavelength_calibration,
+    write_intensity_calibration_csv,
+)
 from ..controller import ScanParams, ScanResult, SLMController
 from ..detector import Detector, SimulatedDetector
 from ..generator import (
@@ -46,11 +58,171 @@ class FunctionWorker(QtCore.QRunnable):
             self.signals.error.emit(traceback.format_exc())
 
 
+class CalibrationProgressDialog(QtWidgets.QDialog):
+    """Live view of an OSA calibration run: phase, progress bar, log and plot.
+
+    update_progress() is called on the GUI thread for every measured step; the
+    plot itself is redrawn on a timer so a fast stream of points cannot flood
+    the event loop. finish() freezes the view and enables Close.
+    """
+
+    _PHASES = {
+        "min_max": ("Step 1 / 3 · Min/Max level sweep", "Level", "Output power (W)"),
+        "wavelength": (
+            "Step 2 / 3 · Wavelength mapping",
+            "x coordinate (px)",
+            "Wavelength (nm)",
+        ),
+        "intensity": (
+            "Step 3 / 3 · Intensity vs level",
+            "Level",
+            "Normalized intensity",
+        ),
+    }
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        on_stop: Callable[[], None] | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Calibration Progress")
+        self.setModal(False)
+        self.resize(760, 600)
+        self._on_stop = on_stop
+        self._running = True
+        self._phase: str | None = None
+        self._xs: list[float] = []
+        self._ys: list[float] = []
+        self._dirty = False
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self.phase_label = QtWidgets.QLabel("Preparing…")
+        self.phase_label.setObjectName("PageSubtitle")
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%v / %m  (%p%)")
+        self.status_label = QtWidgets.QLabel("\N{EN DASH}")
+        self.status_label.setWordWrap(True)
+
+        self.figure = Figure(figsize=(6, 3.2), tight_layout=True)
+        self.canvas = FigureCanvas(self.figure)
+        self.axes = self.figure.add_subplot(111)
+        self._style_axes()
+
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setObjectName("LogBox")
+        self.log.setMaximumHeight(140)
+
+        self.stop_button = QtWidgets.QPushButton("Stop")
+        self.stop_button.setProperty("variant", "danger")
+        self.close_button = QtWidgets.QPushButton("Close")
+        self.close_button.setEnabled(False)
+        self.stop_button.clicked.connect(self._handle_stop)
+        self.close_button.clicked.connect(self.close)
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(self.close_button)
+
+        layout.addWidget(self.phase_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(self.log)
+        layout.addLayout(buttons)
+
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._redraw)
+        self._timer.start(120)
+
+    def _style_axes(self) -> None:
+        self.figure.patch.set_facecolor("#101820")
+        axes = self.axes
+        axes.set_facecolor("#101820")
+        axes.grid(True, color="#2b3a42", linewidth=0.7)
+        axes.tick_params(colors="#d8dee9")
+        axes.xaxis.label.set_color("#d8dee9")
+        axes.yaxis.label.set_color("#d8dee9")
+        for spine in axes.spines.values():
+            spine.set_color("#41515c")
+
+    def update_progress(self, progress: CalibrationProgress) -> None:
+        if progress.phase != self._phase:
+            self._enter_phase(progress.phase)
+        total = max(int(progress.total), 1)
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(min(int(progress.step) + 1, total))
+        self.status_label.setText(progress.message)
+        if progress.x is not None and progress.y is not None:
+            self._xs.append(float(progress.x))
+            self._ys.append(float(progress.y))
+            self._dirty = True
+
+    def _enter_phase(self, phase: str) -> None:
+        self._phase = phase
+        self._xs.clear()
+        self._ys.clear()
+        title, _xlabel, _ylabel = self._PHASES.get(phase, (phase, "x", "y"))
+        self.phase_label.setText(title)
+        self.log.appendPlainText(f"\N{BLACK RIGHT-POINTING TRIANGLE} {title}")
+        self._dirty = True
+
+    def _redraw(self) -> None:
+        if not self._dirty:
+            return
+        self._dirty = False
+        self.axes.clear()
+        self._style_axes()
+        phase = self._phase or ""
+        _title, xlabel, ylabel = self._PHASES.get(phase, (phase, "x", "y"))
+        self.axes.set_xlabel(xlabel)
+        self.axes.set_ylabel(ylabel)
+        if self._xs:
+            self.axes.plot(
+                self._xs,
+                self._ys,
+                color="#47b8e0",
+                marker="o",
+                markersize=3,
+                linewidth=1.0,
+            )
+        self.canvas.draw_idle()
+
+    def finish(self, success: bool, message: str) -> None:
+        self._running = False
+        self._timer.stop()
+        self._dirty = True
+        self._redraw()
+        self.status_label.setText(message)
+        self.log.appendPlainText(message)
+        self.stop_button.setEnabled(False)
+        self.close_button.setEnabled(True)
+        if success:
+            self.progress_bar.setValue(self.progress_bar.maximum())
+
+    def _handle_stop(self) -> None:
+        self.stop_button.setEnabled(False)
+        self.status_label.setText("Stopping…")
+        if self._on_stop is not None:
+            self._on_stop()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # closing mid-run requests a stop but still lets the window close
+        if self._running and self._on_stop is not None:
+            self._on_stop()
+        self._timer.stop()
+        super().closeEvent(event)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     scan_progress = QtCore.pyqtSignal(int, int, str)
     scan_started = QtCore.pyqtSignal(int, int, int, int)
     scan_sample = QtCore.pyqtSignal(float, float)
     keepalive_status = QtCore.pyqtSignal(bool, str)
+    calibration_progress = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -65,6 +237,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._workers: set[FunctionWorker] = set()
         self.slm_size = (1920, 1200)
         self.calibration_fits: dict[float, CalibrationFit] = {}
+        self.osa_controller: OSAController | None = None
+        self.calibration_result: CalibrationResult | None = None
+        self.calibration_stop_event: threading.Event | None = None
+        self.calibration_dialog: CalibrationProgressDialog | None = None
         self.scan_stop_event: threading.Event | None = None
         self.scan_pause_event: threading.Event | None = None
         self.scan_params: ScanParams | None = None
@@ -81,6 +257,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scan_started.connect(self._on_scan_started)
         self.scan_sample.connect(self._on_scan_sample)
         self.keepalive_status.connect(self._on_keepalive_status)
+        self.calibration_progress.connect(self._on_calibration_progress)
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -238,7 +415,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_calibration_page(self) -> QtWidgets.QWidget:
         page = self._page_shell("Calibration")
 
-        controls = self._panel("Measurements")
+        acquisition = self._build_acquisition_panel()
+
+        controls = self._panel("Fit from CSV")
         controls_layout = QtWidgets.QGridLayout(controls)
         self.calibration_path_edit = QtWidgets.QLineEdit()
         browse_button = QtWidgets.QPushButton("Browse")
@@ -270,14 +449,122 @@ class MainWindow(QtWidgets.QMainWindow):
         plot_layout = QtWidgets.QVBoxLayout(plot_panel)
         plot_layout.addWidget(self.canvas)
 
+        # second canvas: the acquired intensity maps (normalized vs raw W)
+        self.map_figure = Figure(figsize=(6, 4), tight_layout=True)
+        self.map_canvas = FigureCanvas(self.map_figure)
+        map_panel = self._panel("Intensity Map")
+        map_layout = QtWidgets.QVBoxLayout(map_panel)
+        map_controls = QtWidgets.QHBoxLayout()
+        self.map_kind_combo = QtWidgets.QComboBox()
+        self.map_kind_combo.addItems(["Normalized", "Raw (W)"])
+        self.map_kind_combo.currentIndexChanged.connect(self._update_intensity_map)
+        map_controls.addWidget(QtWidgets.QLabel("Map"))
+        map_controls.addWidget(self.map_kind_combo)
+        map_controls.addStretch(1)
+        map_layout.addLayout(map_controls)
+        map_layout.addWidget(self.map_canvas)
+
+        right_tabs = QtWidgets.QTabWidget()
+        right_tabs.addTab(plot_panel, "Fit Curve")
+        right_tabs.addTab(map_panel, "Intensity Map")
+
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         split.addWidget(self._panel_with_widget("Fit Parameters", self.fit_table))
-        split.addWidget(plot_panel)
+        split.addWidget(right_tabs)
         split.setSizes([360, 720])
 
+        page.layout().addWidget(acquisition)
         page.layout().addWidget(controls)
         page.layout().addWidget(split, 1)
         return page
+
+    def _build_acquisition_panel(self) -> QtWidgets.QGroupBox:
+        """OSA-driven calibration: connect, sweep, and write a calibration CSV."""
+        panel = self._panel("Acquisition (OSA + SLM)")
+        grid = QtWidgets.QGridLayout(panel)
+
+        # --- OSA connection ---
+        self.osa_host_edit = QtWidgets.QLineEdit("192.168.1.11")
+        self.osa_host_edit.setPlaceholderText("OSA host / IP")
+        self.osa_port_spin = self._spin(1, 65535, 10001)
+        self.osa_connect_button = QtWidgets.QPushButton("Connect OSA")
+        self.osa_disconnect_button = QtWidgets.QPushButton("Disconnect")
+        self.osa_disconnect_button.setProperty("variant", "ghost")
+        self.osa_disconnect_button.setEnabled(False)
+        self.osa_status_label = QtWidgets.QLabel("OSA: closed")
+        self._set_status(self.osa_status_label, "OSA: closed", "off")
+        self.osa_connect_button.clicked.connect(self._connect_osa)
+        self.osa_disconnect_button.clicked.connect(self._disconnect_osa)
+
+        grid.addWidget(QtWidgets.QLabel("OSA Host"), 0, 0)
+        grid.addWidget(self.osa_host_edit, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Port"), 0, 2)
+        grid.addWidget(self.osa_port_spin, 0, 3)
+        grid.addWidget(self.osa_connect_button, 0, 4)
+        grid.addWidget(self.osa_disconnect_button, 0, 5)
+        grid.addWidget(self.osa_status_label, 0, 6)
+
+        # --- measurement settings ---
+        self.cal_center_wl_edit = QtWidgets.QLineEdit("778nm")
+        self.cal_span_edit = QtWidgets.QLineEdit("8nm")
+        self.cal_sensitivity_combo = QtWidgets.QComboBox()
+        self.cal_sensitivity_combo.addItems(["NORM", "MID", "HIGH1", "HIGH2", "HIGH3"])
+        self.cal_sensitivity_combo.setCurrentText("HIGH2")
+        self.cal_ref_level_edit = QtWidgets.QLineEdit("10uW")
+
+        grid.addWidget(QtWidgets.QLabel("Center λ"), 1, 0)
+        grid.addWidget(self.cal_center_wl_edit, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Span"), 1, 2)
+        grid.addWidget(self.cal_span_edit, 1, 3)
+        grid.addWidget(QtWidgets.QLabel("Sensitivity"), 1, 4)
+        grid.addWidget(self.cal_sensitivity_combo, 1, 5)
+        grid.addWidget(self.cal_ref_level_edit, 1, 6)
+
+        # --- sweep configuration ---
+        self.cal_level_start_spin = self._spin(0, 1023, 0)
+        self.cal_level_stop_spin = self._spin(0, 1023, 1023)
+        self.cal_level_step_spin = self._spin(1, 1023, 64)
+        self.cal_window_spin = self._spin(1, 8191, 8)
+        self.cal_wl_window_spin = QtWidgets.QDoubleSpinBox()
+        self.cal_wl_window_spin.setRange(0.0, 50.0)
+        self.cal_wl_window_spin.setDecimals(3)
+        self.cal_wl_window_spin.setSingleStep(0.1)
+        self.cal_wl_window_spin.setValue(0.0)
+        self.cal_wl_window_spin.setSuffix(" nm")
+        self.cal_wl_window_spin.setToolTip(
+            "Averaging window around each wavelength; 0 uses nearest-point averaging"
+        )
+
+        grid.addWidget(QtWidgets.QLabel("Level start"), 2, 0)
+        grid.addWidget(self.cal_level_start_spin, 2, 1)
+        grid.addWidget(QtWidgets.QLabel("stop"), 2, 2)
+        grid.addWidget(self.cal_level_stop_spin, 2, 3)
+        grid.addWidget(QtWidgets.QLabel("step"), 2, 4)
+        grid.addWidget(self.cal_level_step_spin, 2, 5)
+        grid.addWidget(QtWidgets.QLabel("Window px"), 3, 0)
+        grid.addWidget(self.cal_window_spin, 3, 1)
+        grid.addWidget(QtWidgets.QLabel("Avg λ window"), 3, 2)
+        grid.addWidget(self.cal_wl_window_spin, 3, 3)
+
+        # --- output + run ---
+        self.cal_output_edit = QtWidgets.QLineEdit()
+        self.cal_output_edit.setPlaceholderText("Calibration CSV output (blank = temp file)")
+        cal_browse_button = QtWidgets.QPushButton("Browse")
+        cal_browse_button.clicked.connect(self._browse_acquisition_csv)
+        self.run_cal_button = QtWidgets.QPushButton("Run Calibration")
+        self.run_cal_button.setEnabled(False)
+        self.run_cal_button.clicked.connect(self._run_full_calibration)
+        self.stop_cal_button = QtWidgets.QPushButton("Stop")
+        self.stop_cal_button.setProperty("variant", "danger")
+        self.stop_cal_button.setEnabled(False)
+        self.stop_cal_button.clicked.connect(self._stop_full_calibration)
+
+        grid.addWidget(QtWidgets.QLabel("Output CSV"), 4, 0)
+        grid.addWidget(self.cal_output_edit, 4, 1, 1, 3)
+        grid.addWidget(cal_browse_button, 4, 4)
+        grid.addWidget(self.run_cal_button, 4, 5)
+        grid.addWidget(self.stop_cal_button, 4, 6)
+        return panel
 
     def _build_scan_page(self) -> QtWidgets.QWidget:
         page = self._page_shell("Center Scan")
@@ -285,6 +572,10 @@ class MainWindow(QtWidgets.QMainWindow):
         controls = self._panel("Pattern")
         form = QtWidgets.QGridLayout(controls)
         self.scan_level_spin = self._spin(0, 1023, 512)
+        self.bg_level_spin = self._spin(0, 1023, 0)
+        self.bg_level_spin.setToolTip(
+            "Grayscale level applied to every column outside the scan window"
+        )
         self.window_px_spin = self._spin(1, 256, 5)
         self.step_px_spin = self._spin(1, 1024, 5)
         self.start_x_spin = self._spin(0, 8191, 0)
@@ -304,6 +595,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         fields = [
             ("Level", self.scan_level_spin),
+            ("Background", self.bg_level_spin),
             ("Window", self.window_px_spin),
             ("Step", self.step_px_spin),
             ("Start x", self.start_x_spin),
@@ -319,6 +611,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for widget in (
             self.scan_level_spin,
+            self.bg_level_spin,
             self.window_px_spin,
             self.step_px_spin,
             self.start_x_spin,
@@ -330,6 +623,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # changes take effect on the next frame
         self.scan_level_spin.valueChanged.connect(
             lambda value: self._on_scan_param_changed(level=value)
+        )
+        self.bg_level_spin.valueChanged.connect(
+            lambda value: self._on_scan_param_changed(background_level=value)
         )
         self.window_px_spin.valueChanged.connect(
             lambda value: self._on_scan_param_changed(window_px=value)
@@ -869,6 +1165,305 @@ class MainWindow(QtWidgets.QMainWindow):
             json.dump(payload, file, indent=2)
         self._log(f"Saved calibration result: {path}")
 
+    # ----- OSA-driven acquisition -----
+    def _browse_acquisition_csv(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Calibration CSV Output", "calibration.csv", "CSV Files (*.csv)"
+        )
+        if path:
+            self.cal_output_edit.setText(path)
+
+    def _connect_osa(self) -> None:
+        host = self.osa_host_edit.text().strip()
+        if not host:
+            self._log("Enter the OSA host first")
+            return
+        port = self.osa_port_spin.value()
+        self.osa_connect_button.setEnabled(False)
+
+        def connect() -> tuple[OSAController, str]:
+            osa = OSAController(host=host, port=port)
+            osa.connect()
+            return osa, osa.identify()
+
+        self._run_task("Connect OSA", connect, self._on_osa_connected, self._on_osa_error)
+
+    def _on_osa_connected(self, payload: tuple[OSAController, str]) -> None:
+        osa, identity = payload
+        self.osa_controller = osa
+        self._set_status(self.osa_status_label, "OSA: open", "ok")
+        self.osa_connect_button.setEnabled(False)
+        self.osa_disconnect_button.setEnabled(True)
+        self.run_cal_button.setEnabled(True)
+        self._log(f"OSA connected: {identity.strip()}")
+
+    def _on_osa_error(self, _error: str) -> None:
+        self._set_status(self.osa_status_label, "OSA: error", "error")
+        self.osa_connect_button.setEnabled(True)
+
+    def _disconnect_osa(self) -> None:
+        osa = self.osa_controller
+        self.osa_controller = None
+        self.run_cal_button.setEnabled(False)
+        self.osa_disconnect_button.setEnabled(False)
+        self.osa_connect_button.setEnabled(True)
+        self._set_status(self.osa_status_label, "OSA: closed", "off")
+        if osa is not None:
+            self._run_task("Disconnect OSA", osa.disconnect)
+
+    def _calibration_levels(self) -> list[int]:
+        start = self.cal_level_start_spin.value()
+        stop = self.cal_level_stop_spin.value()
+        step = self.cal_level_step_spin.value()
+        if stop < start:
+            raise ValueError("level stop must be >= level start")
+        levels = list(range(start, stop + 1, step))
+        if not levels:
+            levels = [start]
+        if levels[-1] != stop:
+            levels.append(stop)
+        return levels
+
+    def _measurement_settings(self) -> MeasurementSettings:
+        return MeasurementSettings(
+            center_wl=self.cal_center_wl_edit.text().strip() or "778nm",
+            span=self.cal_span_edit.text().strip() or "8nm",
+            sensitivity=self.cal_sensitivity_combo.currentText(),
+            reference_level=self.cal_ref_level_edit.text().strip() or "10uW",
+            y_unit="LINear",
+        )
+
+    def _set_calibration_running(self, running: bool) -> None:
+        self.run_cal_button.setEnabled(not running and self.osa_controller is not None)
+        self.stop_cal_button.setEnabled(running)
+        self.osa_connect_button.setEnabled(False if running else self.osa_controller is None)
+        self.osa_disconnect_button.setEnabled(
+            False if running else self.osa_controller is not None
+        )
+
+    def _run_full_calibration(self) -> None:
+        osa = self.osa_controller
+        if osa is None or not osa.is_connected:
+            self._log("Connect to the OSA first")
+            return
+        try:
+            levels = self._calibration_levels()
+        except ValueError as exc:
+            self._log(f"Invalid level sweep: {exc}")
+            QtWidgets.QMessageBox.warning(self, "Calibration", str(exc))
+            return
+
+        settings = self._measurement_settings()
+        window = self.cal_window_spin.value()
+        wl_window = self.cal_wl_window_spin.value() or None
+        output = self.cal_output_edit.text().strip() or None
+        controller = self._controller()
+        stop_event = threading.Event()
+        self.calibration_stop_event = stop_event
+        self._set_calibration_running(True)
+        self._open_calibration_dialog()
+        self._log(
+            f"Calibration started: {len(levels)} levels, window {window} px"
+        )
+
+        # the callback runs on the worker thread, so hop to the GUI thread
+        def report(progress: CalibrationProgress) -> None:
+            self.calibration_progress.emit(progress)
+
+        def run() -> dict[str, Any]:
+            try:
+                _min_i, _max_i, min_level, max_level, _records = (
+                    find_min_max_intensity_levels(
+                        osa,
+                        controller,
+                        levels,
+                        settings,
+                        stop_event=stop_event,
+                        progress_callback=report,
+                    )
+                )
+                seed = CalibrationResult(
+                    wavelength=np.asarray([]),
+                    coordinates=np.asarray([]),
+                    max_level=max_level,
+                    min_level=min_level,
+                    level_range=np.asarray(levels, dtype=int),
+                )
+                wl_result = wavelength_calibration(
+                    osa,
+                    controller,
+                    levels,
+                    settings,
+                    seed,
+                    window_size=window,
+                    stop_event=stop_event,
+                    progress_callback=report,
+                )
+                final = intensity_calibration(
+                    osa,
+                    controller,
+                    levels,
+                    settings,
+                    wl_result,
+                    window_size=window,
+                    wavelength_window_nm=wl_window,
+                    stop_event=stop_event,
+                    progress_callback=report,
+                )
+                csv_path = write_intensity_calibration_csv(
+                    final, output or _temporary_calibration_csv()
+                )
+            except CalibrationAborted:
+                # report as an ordinary result so no error dialog is shown
+                return {"status": "aborted"}
+            return {
+                "status": "ok",
+                "result": final,
+                "csv": csv_path,
+                "min_level": min_level,
+                "max_level": max_level,
+            }
+
+        # treat acquisition as an SLM task so the DVI keep-alive is suspended
+        self._run_slm_task(
+            "Run calibration",
+            run,
+            self._on_full_calibration,
+            self._on_full_calibration_error,
+        )
+
+    def _open_calibration_dialog(self) -> None:
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.close()
+        dialog = CalibrationProgressDialog(self, on_stop=self._stop_full_calibration)
+        dialog.setStyleSheet(DARK_STYLESHEET)
+        dialog.finished.connect(self._on_calibration_dialog_closed)
+        self.calibration_dialog = dialog
+        dialog.show()
+
+    def _on_calibration_dialog_closed(self, _result: int) -> None:
+        self.calibration_dialog = None
+
+    def _on_calibration_progress(self, progress: CalibrationProgress) -> None:
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.update_progress(progress)
+
+    def _stop_full_calibration(self) -> None:
+        if self.calibration_stop_event is not None:
+            self.calibration_stop_event.set()
+            self._log("Calibration stop requested")
+
+    def _on_full_calibration(self, payload: dict[str, Any]) -> None:
+        self.calibration_stop_event = None
+        self._set_calibration_running(False)
+        if payload.get("status") == "aborted":
+            self._log("Calibration stopped")
+            if self.calibration_dialog is not None:
+                self.calibration_dialog.finish(False, "Calibration stopped")
+            return
+        result = payload["result"]
+        csv_path = payload["csv"]
+        self.calibration_result = result
+        self._log(
+            f"Calibration done: min level {payload['min_level']}, "
+            f"max level {payload['max_level']}, "
+            f"{result.coordinates.size} coordinates"
+        )
+        self._log(f"Calibration CSV saved: {csv_path}")
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.finish(
+                True,
+                f"Done · {result.coordinates.size} coordinates · saved {csv_path}",
+            )
+        self.calibration_path_edit.setText(str(csv_path))
+        self.map_kind_combo.setCurrentIndex(0)
+        self._update_intensity_map()
+        # feed the freshly written CSV into the existing fit + plot flow
+        self._run_calibration_fit()
+
+    def _on_full_calibration_error(self, _error: str) -> None:
+        # _fail_task already logged the traceback and showed a dialog
+        self.calibration_stop_event = None
+        self._set_calibration_running(False)
+        if self.calibration_dialog is not None:
+            self.calibration_dialog.finish(False, "Calibration failed")
+
+    def _style_dark_axes(self, axes: Any) -> None:
+        axes.set_facecolor("#101820")
+        axes.grid(True, color="#2b3a42", linewidth=0.7)
+        axes.tick_params(colors="#d8dee9")
+        axes.xaxis.label.set_color("#d8dee9")
+        axes.yaxis.label.set_color("#d8dee9")
+        for spine in axes.spines.values():
+            spine.set_color("#41515c")
+
+    def _update_intensity_map(self) -> None:
+        if not hasattr(self, "map_canvas"):
+            return
+        self.map_figure.clear()
+        self.map_figure.patch.set_facecolor("#101820")
+        axes = self.map_figure.add_subplot(111)
+        self._style_dark_axes(axes)
+
+        result = self.calibration_result
+        if result is None or result.intensity_levels is None:
+            axes.text(
+                0.5,
+                0.5,
+                "Run a calibration to see the intensity map",
+                ha="center",
+                va="center",
+                color="#d8dee9",
+                transform=axes.transAxes,
+            )
+            self.map_canvas.draw_idle()
+            return
+
+        raw = self.map_kind_combo.currentText().startswith("Raw")
+        data = result.raw_intensity_levels if raw else result.intensity_levels
+        if data is None:
+            axes.text(
+                0.5,
+                0.5,
+                "Raw intensity map is not available",
+                ha="center",
+                va="center",
+                color="#d8dee9",
+                transform=axes.transAxes,
+            )
+            self.map_canvas.draw_idle()
+            return
+
+        data = np.asarray(data, dtype=float)
+        levels = np.asarray(result.level_range, dtype=float)
+        wavelengths = np.asarray(result.wavelength, dtype=float)
+        extent = [
+            float(levels.min()),
+            float(levels.max()),
+            float(wavelengths.min()),
+            float(wavelengths.max()),
+        ]
+        if extent[0] == extent[1]:
+            extent[1] += 1.0
+        if extent[2] == extent[3]:
+            extent[3] += 1.0
+        image = axes.imshow(
+            data,
+            aspect="auto",
+            origin="lower",
+            extent=(extent[0], extent[1], extent[2], extent[3]),
+            cmap="viridis",
+        )
+        axes.set_xlabel("Level")
+        axes.set_ylabel("Wavelength (nm)")
+        colorbar = self.map_figure.colorbar(image, ax=axes)
+        colorbar.set_label("Intensity (W)" if raw else "Normalized intensity")
+        colorbar.ax.yaxis.set_tick_params(color="#d8dee9")
+        colorbar.ax.yaxis.label.set_color("#d8dee9")
+        for label in colorbar.ax.get_yticklabels():
+            label.set_color("#d8dee9")
+        self.map_canvas.draw_idle()
+
     def _browse_scan_output(self) -> None:
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if path:
@@ -896,6 +1491,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 window_px=self.window_px_spin.value(),
                 step_px=self.step_px_spin.value(),
                 dwell_seconds=self.dwell_spin.value(),
+                background_level=self.bg_level_spin.value(),
             )
         except ValueError as exc:
             self._log(f"Invalid scan parameters: {exc}")
@@ -1050,6 +1646,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 min(self.start_x_spin.value(), width - 1),
                 self.scan_level_spin.value(),
                 self.window_px_spin.value(),
+                self.bg_level_spin.value(),
             )
         except ValueError as exc:
             self.preview_label.setText(str(exc))
@@ -1246,16 +1843,32 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.scan_pause_event is not None:
             # wake a paused scan so the worker can observe the stop event
             self.scan_pause_event.clear()
+        if self.calibration_stop_event is not None:
+            self.calibration_stop_event.set()
         self.thread_pool.waitForDone(3000)
         if self.controller is not None and getattr(self.controller, "is_open", False):
             try:
                 self.controller.close_slm()
             except Exception:
                 pass
+        if self.osa_controller is not None:
+            try:
+                self.osa_controller.disconnect()
+            except Exception:
+                pass
+            self.osa_controller = None
         super().closeEvent(event)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(DARK_STYLESHEET)
+
+
+def _temporary_calibration_csv() -> Path:
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".csv", prefix="santec_calibration_", delete=False
+    )
+    handle.close()
+    return Path(handle.name)
 
 
 def main(argv: list[str] | None = None) -> int:

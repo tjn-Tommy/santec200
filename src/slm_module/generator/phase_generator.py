@@ -34,14 +34,18 @@ def make_vertical_window(
     x_start: int,
     level: int,
     window_px: int = 5,
+    background_level: int = 0,
 ) -> np.ndarray:
     width = _positive_int(width, "width")
     height = _positive_int(height, "height")
     x_start = _bounded_int(x_start, "x_start", 0, width - 1)
     window_px = _positive_int(window_px, "window_px")
     level = _bounded_int(level, "level", MIN_LEVEL, MAX_LEVEL)
+    background_level = _bounded_int(
+        background_level, "background_level", MIN_LEVEL, MAX_LEVEL
+    )
 
-    data = np.zeros((height, width), dtype=np.uint16)
+    data = np.full((height, width), background_level, dtype=np.uint16)
     x_end = min(width, x_start + window_px)
     data[:, x_start:x_end] = level
     return data
@@ -161,6 +165,7 @@ def generate_center_scan(
     step_px: int = 5,
     start_x: int = 0,
     end_x: int | None = None,
+    background_level: int = 0,
 ) -> Iterator[PhasePattern]:
     for x_start in iter_center_scan_positions(
         width,
@@ -169,7 +174,9 @@ def generate_center_scan(
         start_x=start_x,
         end_x=end_x,
     ):
-        data = make_vertical_window(width, height, x_start, level, window_px)
+        data = make_vertical_window(
+            width, height, x_start, level, window_px, background_level
+        )
         yield PhasePattern(x_start=x_start, x_end=min(width, x_start + window_px), data=data)
 
 
@@ -199,6 +206,7 @@ def export_center_scan_sequence(
     step_px: int = 5,
     start_x: int = 0,
     end_x: int | None = None,
+    background_level: int = 0,
     prefix: str = "center_scan",
 ) -> list[Path]:
     output_path = Path(output_dir).resolve()
@@ -211,6 +219,7 @@ def export_center_scan_sequence(
         step_px=step_px,
         start_x=start_x,
         end_x=end_x,
+        background_level=background_level,
     ):
         csv_path = output_path / f"{prefix}_x{pattern.x_start:04d}.csv"
         paths.append(write_santec_csv(pattern.data, csv_path))

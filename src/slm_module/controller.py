@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from .detector import (
     CenterResult,
     Detector,
@@ -127,6 +129,7 @@ class ScanSettings:
     window_px: int
     step_px: int
     dwell_seconds: float
+    background_level: int
 
 
 class ScanParams:
@@ -142,12 +145,14 @@ class ScanParams:
         window_px: int = 5,
         step_px: int = 5,
         dwell_seconds: float = 0.2,
+        background_level: int = 0,
     ):
         self._lock = threading.Lock()
         self._level = _validate_level(level)
         self._window_px = _validate_positive_int(window_px, "window_px")
         self._step_px = _validate_positive_int(step_px, "step_px")
         self._dwell_seconds = _validate_positive_float(dwell_seconds, "dwell_seconds")
+        self._background_level = _validate_level(background_level)
 
     def update(
         self,
@@ -156,6 +161,7 @@ class ScanParams:
         window_px: int | None = None,
         step_px: int | None = None,
         dwell_seconds: float | None = None,
+        background_level: int | None = None,
     ) -> None:
         with self._lock:
             if level is not None:
@@ -168,6 +174,8 @@ class ScanParams:
                 self._dwell_seconds = _validate_positive_float(
                     dwell_seconds, "dwell_seconds"
                 )
+            if background_level is not None:
+                self._background_level = _validate_level(background_level)
 
     def snapshot(self) -> ScanSettings:
         with self._lock:
@@ -176,6 +184,7 @@ class ScanParams:
                 window_px=self._window_px,
                 step_px=self._step_px,
                 dwell_seconds=self._dwell_seconds,
+                background_level=self._background_level,
             )
 
 
@@ -298,6 +307,18 @@ class SLMController:
             self.driver.load_csv(resolved, interval)
             self._last_display = ("csv", resolved)
 
+    # load npy array as a csv. input should be 2D
+    def display_array(self, arr: np.ndarray, interval: float = 0.2) -> None:
+        slm_width, slm_height = self.get_slm_info()
+        if arr.ndim != 2:
+            raise ValueError(f"Input array must be 2D, got shape {arr.shape}")
+        if arr.shape != (slm_height, slm_width):
+            raise ValueError(
+                f"Input array shape {arr.shape} does not match SLM dimensions "
+                f"({slm_height}, {slm_width})"
+            )
+        self.display_mask_csv(arr, interval=interval)
+
     def display_mask_csv(
         self,
         data,
@@ -322,9 +343,12 @@ class SLMController:
         window_px: int = 5,
         csv_path: str | Path | None = None,
         interval: float = 0.2,
+        background_level: int = 0,
     ) -> Path:
         slm_width, slm_height = self.get_slm_info()
-        data = make_vertical_window(slm_width, slm_height, x_start, level, window_px)
+        data = make_vertical_window(
+            slm_width, slm_height, x_start, level, window_px, background_level
+        )
         return self.display_mask_csv(data, csv_path=csv_path, interval=interval)
 
     def ping(self, slm_number: int = 1, verify_dvi: bool = False) -> None:
@@ -404,7 +428,12 @@ class SLMController:
             settings = params.snapshot()
 
             data = make_vertical_window(
-                slm_width, slm_height, position, settings.level, settings.window_px
+                slm_width,
+                slm_height,
+                position,
+                settings.level,
+                settings.window_px,
+                settings.background_level,
             )
             csv_path = output_path / f"center_scan_x{position:04d}.csv"
             write_santec_csv(data, csv_path)
@@ -454,6 +483,7 @@ class SLMController:
         start_x: int = 0,
         end_x: int | None = None,
         dwell_seconds: float = 0.2,
+        background_level: int = 0,
         output_dir: str | Path | None = None,
         stop_event: threading.Event | None = None,
         progress_callback: Callable[[int, Path], None] | None = None,
@@ -464,6 +494,7 @@ class SLMController:
             window_px=window_px,
             step_px=step_px,
             dwell_seconds=dwell_seconds,
+            background_level=background_level,
         )
         adapted = (
             (lambda index, _x, path: progress_callback(index, path))

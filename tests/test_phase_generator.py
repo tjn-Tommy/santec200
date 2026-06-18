@@ -32,6 +32,17 @@ class PhaseGeneratorTests(unittest.TestCase):
         self.assertTrue(np.all(data[:, :6] == 0))
         self.assertTrue(np.all(data[:, 6:8] == 700))
 
+    def test_make_vertical_window_uses_tunable_background(self) -> None:
+        data = make_vertical_window(
+            width=8, height=3, x_start=2, level=700, window_px=3, background_level=120
+        )
+
+        self.assertTrue(np.all(data[:, 2:5] == 700))
+        self.assertTrue(np.all(data[:, :2] == 120))
+        self.assertTrue(np.all(data[:, 5:] == 120))
+        with self.assertRaises(ValueError):
+            make_vertical_window(8, 3, 2, 700, 3, background_level=2000)
+
     def test_scan_positions_are_inclusive_start_positions(self) -> None:
         positions = list(iter_center_scan_positions(20, step_px=5, start_x=0, end_x=12))
 

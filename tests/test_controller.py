@@ -7,6 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from slm_module.controller import ScanParams, SLMController, validate_slm_csv
@@ -70,6 +72,25 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(result, path.resolve())
             self.assertEqual(len(fake.loaded_csv), 1)
             validate_slm_csv(result, expected_width=8, expected_height=3)
+
+    def test_display_array_writes_santec_csv(self) -> None:
+        fake = FakeDriver(size=(8, 3))
+        controller = SLMController(driver=fake)
+        data = np.full((3, 8), 512, dtype=np.uint16)
+
+        try:
+            controller.display_array(data, interval=0.01)
+            loaded_path = Path(fake.loaded_csv[-1][0])
+
+            self.assertEqual(len(fake.loaded_csv), 1)
+            self.assertTrue(loaded_path.exists())
+            validate_slm_csv(loaded_path, expected_width=8, expected_height=3)
+
+            self.assertTrue(controller.refresh_display())
+            self.assertEqual(fake.loaded_csv[-1], (str(loaded_path), 0.0))
+        finally:
+            if fake.loaded_csv:
+                Path(fake.loaded_csv[0][0]).unlink(missing_ok=True)
 
     def test_display_center_scan_stops_when_event_is_set(self) -> None:
         fake = FakeDriver(size=(10, 2))
@@ -200,6 +221,34 @@ class RunCenterScanTests(unittest.TestCase):
             params.update(step_px=0)
         params.update(dwell_seconds=1.5)
         self.assertEqual(params.snapshot().dwell_seconds, 1.5)
+
+    def test_scan_params_tracks_background_level(self) -> None:
+        params = ScanParams(100, background_level=50)
+        self.assertEqual(params.snapshot().background_level, 50)
+        params.update(background_level=200)
+        self.assertEqual(params.snapshot().background_level, 200)
+        with self.assertRaises(ValueError):
+            params.update(background_level=5000)
+
+    def test_run_center_scan_applies_background_level(self) -> None:
+        import csv as csv_module
+
+        fake = FakeDriver(size=(10, 2))
+        controller = SLMController(driver=fake)
+        params = ScanParams(
+            800, window_px=2, step_px=4, dwell_seconds=0.001, background_level=100
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = controller.run_center_scan(params, output_dir=temp_dir)
+            with open(result.frames[0], newline="") as handle:
+                rows = list(csv_module.reader(handle))
+            # drop the header row and the leading y-index column
+            data_row = [int(value) for value in rows[1][1:]]
+
+        # window of width 2 at position 0, background elsewhere
+        self.assertEqual(data_row[:2], [800, 800])
+        self.assertTrue(all(value == 100 for value in data_row[2:]))
 
 
 class RefreshDisplayTests(unittest.TestCase):

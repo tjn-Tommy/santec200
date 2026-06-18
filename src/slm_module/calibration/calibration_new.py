@@ -1,0 +1,643 @@
+from __future__ import annotations
+
+import csv
+import threading
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from osa_module.controller import MeasurementSettings, OSAController, TraceData
+from slm_module.controller import SLMController
+
+
+"""
+Calibration module for Santec SLM with AQ637X OSA.
+
+Step 1: find rough minimum and maximum intensity levels by sweeping full-screen
+grayscale levels.
+Step 2: use a bright window sweep to map SLM x coordinates to wavelengths.
+Step 3: for each calibrated coordinate, sweep grayscale levels and measure both
+the absolute (background-subtracted, in watts) and the normalized intensity
+averaged around that coordinate's calibrated wavelength.
+"""
+
+
+class CalibrationAborted(Exception):
+    """Raised when a stop_event interrupts a calibration sweep."""
+
+
+@dataclass
+class CalibrationProgress:
+    """A single live update emitted during calibration acquisition.
+
+    phase is one of "min_max", "wavelength", or "intensity". step is the 0-based
+    index within that phase and total is the number of steps in it, so a UI can
+    drive a per-phase progress bar. message describes the step's result; x/y are
+    an optional data point for a live plot (units depend on the phase).
+    """
+
+    phase: str
+    step: int
+    total: int
+    message: str
+    x: float | None = None
+    y: float | None = None
+
+
+ProgressCallback = Callable[["CalibrationProgress"], None]
+
+
+def _report(
+    progress_callback: ProgressCallback | None,
+    phase: str,
+    step: int,
+    total: int,
+    message: str,
+    *,
+    x: float | None = None,
+    y: float | None = None,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(
+            CalibrationProgress(
+                phase=phase, step=step, total=total, message=message, x=x, y=y
+            )
+        )
+
+
+@dataclass
+class CalibrationResult:
+    wavelength: np.ndarray
+    coordinates: np.ndarray
+    max_level: int | np.ndarray
+    min_level: int | np.ndarray
+    level_range: np.ndarray
+    intensity_levels: np.ndarray | None = None
+    raw_intensity_levels: np.ndarray | None = None
+    wavelength_fit_coefficients: np.ndarray | None = None
+
+
+def find_min_max_intensity_levels(
+    osa: OSAController,
+    slm: SLMController,
+    levels: Iterable[int],
+    measure_settings: MeasurementSettings,
+    *,
+    stop_event: threading.Event | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[float, float, int, int, dict[int, float]]:
+    """Sweep full-screen grayscale levels and find rough min/max output power."""
+
+    level_values = _validate_levels(levels)
+    total = int(level_values.size)
+    min_intensity = float("inf")
+    max_intensity = float("-inf")
+    min_level = int(level_values[0])
+    max_level = int(level_values[0])
+    intensity_records: dict[int, float] = {}
+
+    for index, level in enumerate(level_values):
+        _check_stop(stop_event)
+        level_int = int(level)
+        slm.display_grayscale(level_int)
+        trace = osa.measure(measure_settings)
+        intensity = float(np.mean(_trace_power_w(trace)))
+
+        if intensity < min_intensity:
+            min_intensity = intensity
+            min_level = level_int
+        if intensity > max_intensity:
+            max_intensity = intensity
+            max_level = level_int
+        intensity_records[level_int] = intensity
+        _report(
+            progress_callback,
+            "min_max",
+            index,
+            total,
+            f"Level {level_int} -> {intensity:.3e} W",
+            x=float(level_int),
+            y=intensity,
+        )
+
+    return min_intensity, max_intensity, min_level, max_level, intensity_records
+
+
+def local_peak_centroid(
+    wavelengths_m: np.ndarray,
+    intensity_W: np.ndarray,
+    half_window: int = 100,
+) -> tuple[float, int, float]:
+    """
+    Estimate peak center by local weighted centroid.
+
+    The returned center uses the same unit as wavelengths_m. The name is kept
+    for compatibility with earlier code, but callers may pass nm or m.
+
+    Returns:
+        center_wavelength
+        argmax_index
+        peak_strength
+    """
+
+    wavelengths = np.asarray(wavelengths_m, dtype=float)
+    intensity = np.asarray(intensity_W, dtype=float)
+    half_window = _validate_non_negative_int(half_window, "half_window")
+
+    if wavelengths.ndim != 1 or intensity.ndim != 1:
+        raise ValueError("wavelengths_m and intensity_W must be 1D arrays.")
+    if wavelengths.size != intensity.size:
+        raise ValueError(
+            f"wavelengths and intensity size mismatch: "
+            f"{wavelengths.size} vs {intensity.size}"
+        )
+    if wavelengths.size == 0:
+        raise ValueError("Empty trace.")
+
+    y = np.nan_to_num(intensity, nan=0.0, posinf=0.0, neginf=0.0)
+    y = np.clip(y, 0.0, None)
+
+    idx = int(np.argmax(y))
+    peak_strength = float(y[idx])
+    lo = max(0, idx - half_window)
+    hi = min(y.size, idx + half_window + 1)
+
+    x_local = wavelengths[lo:hi]
+    y_local = y[lo:hi].copy()
+    y_local -= np.min(y_local)
+    y_local = np.clip(y_local, 0.0, None)
+
+    weight_sum = float(np.sum(y_local))
+    if weight_sum <= 0:
+        return float(wavelengths[idx]), idx, peak_strength
+
+    center = float(np.sum(x_local * y_local) / weight_sum)
+    return center, idx, peak_strength
+
+
+def mean_near_wavelength(
+    wavelengths_nm: np.ndarray,
+    intensity: np.ndarray,
+    target_wavelength_nm: float,
+    *,
+    half_window_points: int = 2,
+    window_nm: float | None = None,
+) -> float:
+    """Average intensity around target_wavelength_nm.
+
+    If window_nm is provided, all samples within +/- window_nm / 2 are used.
+    Otherwise the nearest sample and half_window_points neighbors on each side
+    are averaged.
+    """
+
+    wavelengths = np.asarray(wavelengths_nm, dtype=float)
+    values = np.asarray(intensity, dtype=float)
+    half_window_points = _validate_non_negative_int(
+        half_window_points, "half_window_points"
+    )
+
+    if wavelengths.ndim != 1 or values.ndim != 1:
+        raise ValueError("wavelengths_nm and intensity must be 1D arrays")
+    if wavelengths.size != values.size:
+        raise ValueError(
+            f"wavelengths and intensity size mismatch: "
+            f"{wavelengths.size} vs {values.size}"
+        )
+    if wavelengths.size == 0:
+        raise ValueError("Empty trace.")
+
+    target = float(target_wavelength_nm)
+    if not np.isfinite(target):
+        raise ValueError("target_wavelength_nm must be finite")
+
+    if window_nm is not None:
+        window = float(window_nm)
+        if not np.isfinite(window) or window <= 0:
+            raise ValueError("window_nm must be positive")
+        mask = np.abs(wavelengths - target) <= window / 2.0
+        if np.any(mask):
+            return _finite_mean(values[mask])
+
+    idx = int(np.argmin(np.abs(wavelengths - target)))
+    lo = max(0, idx - half_window_points)
+    hi = min(values.size, idx + half_window_points + 1)
+    return _finite_mean(values[lo:hi])
+
+
+def wavelength_calibration(
+    osa: OSAController,
+    slm: SLMController,
+    levels: Iterable[int],
+    measure_settings: MeasurementSettings,
+    calibration_results: CalibrationResult,
+    window_size: int = 8,
+    peak_half_window: int = 100,
+    *,
+    stop_event: threading.Event | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> CalibrationResult:
+    """Map SLM x coordinates to wavelengths using a bright-window sweep."""
+
+    del levels
+    slm_width, slm_height = slm.get_slm_info()
+    window_size = _validate_window_size(window_size, slm_width)
+    min_level = _level_value(calibration_results.min_level, "min_level")
+    max_level = _level_value(calibration_results.max_level, "max_level")
+
+    dark_pattern = np.full(slm_width, min_level, dtype=int)
+    _display_1d_pattern(slm, dark_pattern, slm_height)
+    background_trace = osa.measure(measure_settings)
+    background_power = _trace_power_w(background_trace)
+
+    bright_pattern = np.full(slm_width, max_level, dtype=int)
+    _display_1d_pattern(slm, bright_pattern, slm_height)
+    reference_trace = osa.measure(measure_settings)
+    reference_power = _trace_power_w(reference_trace)
+
+    coordinates: list[int] = []
+    wavelengths: list[float] = []
+
+    total = max(0, slm_width - window_size + 1)
+    for index, x_start in enumerate(range(0, slm_width - window_size + 1)):
+        _check_stop(stop_event)
+        pattern = dark_pattern.copy()
+        pattern[x_start : x_start + window_size] = max_level
+        _display_1d_pattern(slm, pattern, slm_height)
+
+        trace = osa.measure(measure_settings)
+        trace_wavelengths, _signal, normalized = _reduce_trace(
+            trace, _trace_power_w(trace), background_power, reference_power
+        )
+        wavelength, _, _ = local_peak_centroid(
+            trace_wavelengths, normalized, half_window=peak_half_window
+        )
+        coordinate = x_start + window_size // 2
+        coordinates.append(coordinate)
+        wavelengths.append(wavelength)
+        _report(
+            progress_callback,
+            "wavelength",
+            index,
+            total,
+            f"x={coordinate} -> {wavelength:.3f} nm",
+            x=float(coordinate),
+            y=float(wavelength),
+        )
+
+    coordinate_array = np.asarray(coordinates, dtype=float)
+    wavelength_array = np.asarray(wavelengths, dtype=float)
+    fitted_wavelengths, coeffs = _fit_wavelength_mapping(
+        coordinate_array, wavelength_array
+    )
+
+    return CalibrationResult(
+        wavelength=fitted_wavelengths,
+        coordinates=coordinate_array,
+        max_level=max_level,
+        min_level=min_level,
+        level_range=np.asarray(calibration_results.level_range, dtype=int),
+        intensity_levels=calibration_results.intensity_levels,
+        wavelength_fit_coefficients=coeffs,
+    )
+
+
+def intensity_calibration(
+    osa: OSAController,
+    slm: SLMController,
+    levels: Iterable[int],
+    measure_settings: MeasurementSettings,
+    calibration_results: CalibrationResult,
+    window_size: int,
+    *,
+    average_half_window: int = 2,
+    wavelength_window_nm: float | None = None,
+    stop_event: threading.Event | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> CalibrationResult:
+    """Sweep levels and measure intensity near each calibrated wavelength.
+
+    intensity_levels (normalized to the bright reference) and
+    raw_intensity_levels (background-subtracted power, in watts) both have shape
+    (n_coordinates, n_levels). Each row belongs to
+    calibration_results.coordinates / calibration_results.wavelength; each
+    column belongs to the corresponding entry in levels.
+    """
+
+    level_values = _validate_levels(levels)
+    coordinates, wavelengths = _calibrated_mapping(calibration_results)
+
+    slm_width, slm_height = slm.get_slm_info()
+    window_size = _validate_window_size(window_size, slm_width)
+    average_half_window = _validate_non_negative_int(
+        average_half_window, "average_half_window"
+    )
+    min_level = _level_value(calibration_results.min_level, "min_level")
+    max_level = _level_value(calibration_results.max_level, "max_level")
+
+    dark_pattern = np.full(slm_width, min_level, dtype=int)
+    _display_1d_pattern(slm, dark_pattern, slm_height)
+    background_trace = osa.measure(measure_settings)
+    background_power = _trace_power_w(background_trace)
+
+    bright_pattern = np.full(slm_width, max_level, dtype=int)
+    _display_1d_pattern(slm, bright_pattern, slm_height)
+    reference_trace = osa.measure(measure_settings)
+    reference_power = _trace_power_w(reference_trace)
+
+    intensity_levels = np.zeros((coordinates.size, level_values.size), dtype=float)
+    raw_intensity_levels = np.zeros((coordinates.size, level_values.size), dtype=float)
+    total = int(coordinates.size * level_values.size)
+    step = 0
+
+    for coordinate_index, (coordinate, wavelength_nm) in enumerate(
+        zip(coordinates, wavelengths)
+    ):
+        x_start = _window_start_from_coordinate(coordinate, window_size, slm_width)
+
+        for level_index, level in enumerate(level_values):
+            _check_stop(stop_event)
+            pattern = dark_pattern.copy()
+            pattern[x_start : x_start + window_size] = int(level)
+            _display_1d_pattern(slm, pattern, slm_height)
+
+            trace = osa.measure(measure_settings)
+            trace_wavelengths, signal, normalized = _reduce_trace(
+                trace, _trace_power_w(trace), background_power, reference_power
+            )
+            raw_value = mean_near_wavelength(
+                trace_wavelengths,
+                signal,
+                float(wavelength_nm),
+                half_window_points=average_half_window,
+                window_nm=wavelength_window_nm,
+            )
+            normalized_value = mean_near_wavelength(
+                trace_wavelengths,
+                normalized,
+                float(wavelength_nm),
+                half_window_points=average_half_window,
+                window_nm=wavelength_window_nm,
+            )
+            raw_intensity_levels[coordinate_index, level_index] = raw_value
+            intensity_levels[coordinate_index, level_index] = normalized_value
+            _report(
+                progress_callback,
+                "intensity",
+                step,
+                total,
+                f"λ {wavelength_nm:.2f} nm "
+                f"({coordinate_index + 1}/{coordinates.size}), "
+                f"level {int(level)} -> {normalized_value:.3f}",
+                x=float(level),
+                y=float(normalized_value),
+            )
+            step += 1
+
+    return CalibrationResult(
+        wavelength=wavelengths,
+        coordinates=coordinates,
+        max_level=max_level,
+        min_level=min_level,
+        level_range=level_values,
+        intensity_levels=intensity_levels,
+        raw_intensity_levels=raw_intensity_levels,
+        wavelength_fit_coefficients=calibration_results.wavelength_fit_coefficients,
+    )
+
+
+def write_intensity_calibration_csv(
+    calibration_results: CalibrationResult,
+    csv_path: str | Path,
+) -> Path:
+    """Write intensity calibration data in long format.
+
+    The first three measurement columns match calibration.load_calibration_csv:
+    wavelength_nm, level, intensity (normalized). coordinate_px and
+    raw_intensity_w (background-subtracted power, in watts) are included as
+    useful extra metadata and are ignored by the existing loader.
+    """
+
+    if calibration_results.intensity_levels is None:
+        raise ValueError("calibration_results.intensity_levels is empty")
+
+    coordinates, wavelengths = _calibrated_mapping(calibration_results)
+    levels = _validate_levels(calibration_results.level_range)
+    intensities = np.asarray(calibration_results.intensity_levels, dtype=float)
+    expected_shape = (coordinates.size, levels.size)
+    if intensities.shape != expected_shape:
+        raise ValueError(
+            f"intensity_levels shape {intensities.shape} does not match "
+            f"(n_coordinates, n_levels) {expected_shape}"
+        )
+
+    raw = calibration_results.raw_intensity_levels
+    if raw is not None:
+        raw = np.asarray(raw, dtype=float)
+        if raw.shape != expected_shape:
+            raise ValueError(
+                f"raw_intensity_levels shape {raw.shape} does not match "
+                f"(n_coordinates, n_levels) {expected_shape}"
+            )
+
+    path = Path(csv_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            ["coordinate_px", "wavelength_nm", "level", "intensity", "raw_intensity_w"]
+        )
+        for index, (coordinate, wavelength_nm, row) in enumerate(
+            zip(coordinates, wavelengths, intensities)
+        ):
+            raw_row = raw[index] if raw is not None else None
+            for level_index, (level, intensity) in enumerate(zip(levels, row)):
+                raw_value = (
+                    "" if raw_row is None else float(raw_row[level_index])
+                )
+                writer.writerow(
+                    [
+                        float(coordinate),
+                        float(wavelength_nm),
+                        int(level),
+                        float(intensity),
+                        raw_value,
+                    ]
+                )
+    return path
+
+
+def _trace_power_w(trace: TraceData) -> np.ndarray:
+    powers = np.asarray(trace.powers, dtype=float)
+    if trace.power_label == "power_dBm":
+        powers = 1e-3 * (10.0 ** (powers / 10.0))
+    return np.nan_to_num(powers, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _check_stop(stop_event: threading.Event | None) -> None:
+    if stop_event is not None and stop_event.is_set():
+        raise CalibrationAborted("calibration stopped by request")
+
+
+def _reduce_trace(
+    trace: TraceData,
+    power_w: np.ndarray,
+    background_power_w: np.ndarray,
+    reference_power_w: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reduce a measured trace to (wavelengths, signal_W, normalized).
+
+    signal_W is the background-subtracted power in watts (clipped at 0);
+    normalized divides that by the bright reference (reference - background),
+    also clipped at 0. Both share the returned wavelength axis.
+    """
+    count = min(
+        trace.wavelengths_nm.size,
+        power_w.size,
+        background_power_w.size,
+        reference_power_w.size,
+    )
+    if count <= 0:
+        raise ValueError("Trace, background, and reference must not be empty")
+
+    wavelengths = trace.wavelengths_nm[:count]
+    signal = np.asarray(power_w[:count], dtype=float) - background_power_w[:count]
+    signal = np.clip(np.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+
+    denominator = reference_power_w[:count] - background_power_w[:count]
+    normalized = np.zeros(count, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        np.divide(
+            signal,
+            denominator,
+            out=normalized,
+            where=np.abs(denominator) > np.finfo(float).eps,
+        )
+
+    normalized = np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
+    return wavelengths, signal, np.clip(normalized, 0.0, None)
+
+
+def _display_1d_pattern(
+    slm: SLMController,
+    pattern: np.ndarray,
+    slm_height: int,
+) -> None:
+    pattern = np.asarray(pattern, dtype=int)
+    if pattern.ndim != 1:
+        raise ValueError("pattern must be a 1D array")
+    slm.display_array(np.broadcast_to(pattern[None, :], (slm_height, pattern.size)).copy())
+
+
+def _fit_wavelength_mapping(
+    coordinates: np.ndarray,
+    wavelengths_nm: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    if coordinates.size == 0:
+        raise ValueError("No wavelength calibration points were collected")
+    if coordinates.size != wavelengths_nm.size:
+        raise ValueError("coordinates and wavelengths_nm must have the same length")
+
+    if coordinates.size == 1:
+        return wavelengths_nm.astype(float, copy=True), np.asarray([wavelengths_nm[0]])
+
+    degree = min(3, coordinates.size - 1)
+    coeffs = np.polyfit(coordinates, wavelengths_nm, deg=degree)
+    return np.polyval(coeffs, coordinates), coeffs
+
+
+def _calibrated_mapping(
+    calibration_results: CalibrationResult,
+) -> tuple[np.ndarray, np.ndarray]:
+    coordinates = np.asarray(calibration_results.coordinates, dtype=float)
+    wavelengths = np.asarray(calibration_results.wavelength, dtype=float)
+
+    if coordinates.ndim != 1 or wavelengths.ndim != 1:
+        raise ValueError("coordinates and wavelength must be 1D arrays")
+    if coordinates.size == 0:
+        raise ValueError("wavelength calibration must run before intensity calibration")
+    if coordinates.size != wavelengths.size:
+        raise ValueError(
+            f"coordinates and wavelength size mismatch: "
+            f"{coordinates.size} vs {wavelengths.size}"
+        )
+    if not np.all(np.isfinite(coordinates)) or not np.all(np.isfinite(wavelengths)):
+        raise ValueError("coordinates and wavelength must be finite")
+
+    order = np.argsort(coordinates)
+    return coordinates[order], wavelengths[order]
+
+
+def _window_start_from_coordinate(
+    coordinate: float,
+    window_size: int,
+    slm_width: int,
+) -> int:
+    start = int(round(float(coordinate))) - window_size // 2
+    return max(0, min(start, slm_width - window_size))
+
+
+def _validate_levels(levels: Iterable[int]) -> np.ndarray:
+    try:
+        values = np.asarray(list(levels), dtype=float)
+    except TypeError as exc:
+        raise ValueError("levels must be an iterable of integers") from exc
+
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("levels must be a non-empty 1D sequence")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("levels must be finite")
+
+    rounded = np.rint(values)
+    if not np.array_equal(values, rounded):
+        raise ValueError("levels must contain integer grayscale levels")
+    if np.any(rounded < 0) or np.any(rounded > 1023):
+        raise ValueError("levels must be in 0..1023")
+    return rounded.astype(int)
+
+
+def _level_value(value: int | np.ndarray, name: str) -> int:
+    array = np.asarray(value, dtype=float)
+    if array.size == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must be finite")
+    if array.size > 1 and not np.all(array == array.flat[0]):
+        raise ValueError(f"{name} must be a scalar level")
+
+    level = float(array.flat[0])
+    rounded = round(level)
+    if level != rounded:
+        raise ValueError(f"{name} must be an integer level")
+    if rounded < 0 or rounded > 1023:
+        raise ValueError(f"{name} must be in 0..1023")
+    return int(rounded)
+
+
+def _validate_window_size(window_size: int, slm_width: int) -> int:
+    result = _validate_non_negative_int(window_size, "window_size")
+    if result <= 0:
+        raise ValueError("window_size must be positive")
+    if result > slm_width:
+        raise ValueError("window_size cannot exceed SLM width")
+    return result
+
+
+def _validate_non_negative_int(value: Any, name: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return result
+
+
+def _finite_mean(values: np.ndarray) -> float:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return 0.0
+    return float(np.mean(finite))

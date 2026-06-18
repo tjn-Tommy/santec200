@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import csv
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from osa_module.controller import MeasurementSettings, TraceData
+from slm_module.calibration.calibration import load_calibration_csv
+from slm_module.calibration.calibration_new import (
+    CalibrationAborted,
+    CalibrationResult,
+    intensity_calibration,
+    mean_near_wavelength,
+    write_intensity_calibration_csv,
+)
+
+
+class FakeOSA:
+    def __init__(self, traces: list[TraceData]):
+        self.traces = list(traces)
+        self.measure_calls = 0
+
+    def measure(self, settings: MeasurementSettings) -> TraceData:
+        del settings
+        if self.measure_calls >= len(self.traces):
+            raise AssertionError("No trace left for FakeOSA")
+        trace = self.traces[self.measure_calls]
+        self.measure_calls += 1
+        return trace
+
+
+class FakeSLM:
+    def __init__(self, size: tuple[int, int] = (5, 2)):
+        self.size = size
+        self.arrays: list[np.ndarray] = []
+
+    def get_slm_info(self) -> tuple[int, int]:
+        return self.size
+
+    def display_array(self, arr: np.ndarray, interval: float = 0.2) -> None:
+        del interval
+        self.arrays.append(np.asarray(arr).copy())
+
+
+def make_trace(wavelengths_nm: np.ndarray, powers_w: list[float]) -> TraceData:
+    return TraceData(
+        wavelengths=wavelengths_nm * 1e-9,
+        powers=np.asarray(powers_w, dtype=float),
+        trace_id="TRA",
+        y_unit="LINear",
+    )
+
+
+class CalibrationNewTests(unittest.TestCase):
+    def test_mean_near_wavelength_averages_neighbors(self) -> None:
+        wavelengths = np.asarray([100.0, 101.0, 102.0, 103.0])
+        intensity = np.asarray([1.0, 3.0, 5.0, 7.0])
+
+        value = mean_near_wavelength(wavelengths, intensity, 101.2, half_window_points=1)
+
+        self.assertEqual(value, 3.0)
+
+    def test_intensity_calibration_uses_calibrated_wavelength_neighborhood(self) -> None:
+        wavelengths = np.asarray([100.0, 101.0, 102.0, 103.0, 104.0])
+        traces = [
+            make_trace(wavelengths, [0, 0, 0, 0, 0]),
+            make_trace(wavelengths, [1, 1, 1, 1, 1]),
+            make_trace(wavelengths, [0.1, 0.2, 0.3, 0.9, 0.9]),
+            make_trace(wavelengths, [0.4, 0.6, 0.8, 0.9, 0.9]),
+            make_trace(wavelengths, [0.9, 0.9, 0.2, 0.4, 0.6]),
+            make_trace(wavelengths, [0.9, 0.9, 0.5, 0.7, 0.9]),
+        ]
+        osa = FakeOSA(traces)
+        slm = FakeSLM(size=(5, 2))
+        seed = CalibrationResult(
+            wavelength=np.asarray([101.0, 103.0]),
+            coordinates=np.asarray([1.0, 3.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([0, 100]),
+        )
+
+        result = intensity_calibration(
+            osa,
+            slm,
+            [0, 100],
+            MeasurementSettings(),
+            seed,
+            window_size=2,
+            average_half_window=1,
+        )
+
+        np.testing.assert_allclose(
+            result.intensity_levels,
+            np.asarray([[0.2, 0.6], [0.4, 0.7]]),
+        )
+        np.testing.assert_array_equal(result.level_range, np.asarray([0, 100]))
+        self.assertEqual(osa.measure_calls, 6)
+
+    def test_intensity_calibration_keeps_raw_and_normalized_maps(self) -> None:
+        wavelengths = np.asarray([100.0, 101.0, 102.0])
+        traces = [
+            make_trace(wavelengths, [0.1, 0.1, 0.1]),  # background
+            make_trace(wavelengths, [2.1, 2.1, 2.1]),  # reference -> denom 2.0
+            make_trace(wavelengths, [0.5, 0.5, 0.5]),  # one level measurement
+        ]
+        osa = FakeOSA(traces)
+        slm = FakeSLM(size=(3, 2))
+        seed = CalibrationResult(
+            wavelength=np.asarray([101.0]),
+            coordinates=np.asarray([1.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([200]),
+        )
+
+        result = intensity_calibration(
+            osa,
+            slm,
+            [200],
+            MeasurementSettings(),
+            seed,
+            window_size=1,
+            average_half_window=0,
+        )
+
+        # raw = power - background (0.5 - 0.1); normalized = raw / (2.1 - 0.1)
+        np.testing.assert_allclose(result.raw_intensity_levels, np.asarray([[0.4]]))
+        np.testing.assert_allclose(result.intensity_levels, np.asarray([[0.2]]))
+
+    def test_intensity_calibration_aborts_on_stop_event(self) -> None:
+        wavelengths = np.asarray([100.0, 101.0])
+        traces = [
+            make_trace(wavelengths, [0.0, 0.0]),
+            make_trace(wavelengths, [1.0, 1.0]),
+            make_trace(wavelengths, [0.5, 0.5]),
+        ]
+        osa = FakeOSA(traces)
+        slm = FakeSLM(size=(2, 2))
+        seed = CalibrationResult(
+            wavelength=np.asarray([100.0]),
+            coordinates=np.asarray([0.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([0, 100]),
+        )
+        stop_event = threading.Event()
+        stop_event.set()
+
+        with self.assertRaises(CalibrationAborted):
+            intensity_calibration(
+                osa,
+                slm,
+                [0, 100],
+                MeasurementSettings(),
+                seed,
+                window_size=1,
+                stop_event=stop_event,
+            )
+
+    def test_write_intensity_calibration_csv_includes_raw_column(self) -> None:
+        result = CalibrationResult(
+            wavelength=np.asarray([101.0]),
+            coordinates=np.asarray([1.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([0, 100]),
+            intensity_levels=np.asarray([[0.2, 0.6]]),
+            raw_intensity_levels=np.asarray([[0.4, 1.2]]),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_intensity_calibration_csv(result, Path(temp_dir) / "cal.csv")
+            with open(path, encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertIn("raw_intensity_w", rows[0])
+        self.assertAlmostEqual(float(rows[0]["raw_intensity_w"]), 0.4)
+        self.assertAlmostEqual(float(rows[1]["raw_intensity_w"]), 1.2)
+
+    def test_write_intensity_calibration_csv_matches_legacy_loader(self) -> None:
+        result = CalibrationResult(
+            wavelength=np.asarray([101.0]),
+            coordinates=np.asarray([1.0]),
+            max_level=100,
+            min_level=0,
+            level_range=np.asarray([0, 100]),
+            intensity_levels=np.asarray([[0.2, 0.6]]),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = write_intensity_calibration_csv(
+                result, Path(temp_dir) / "calibration.csv"
+            )
+            points = load_calibration_csv(path)
+
+        self.assertEqual(len(points), 2)
+        self.assertEqual(points[0].wavelength_nm, 101.0)
+        self.assertEqual(points[1].level, 100)
+        self.assertEqual(points[1].intensity, 0.6)
+
+
+if __name__ == "__main__":
+    unittest.main()

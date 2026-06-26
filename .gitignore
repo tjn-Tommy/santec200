@@ -3,3 +3,8 @@ __pycache__/
 .vscode/
 settings.json
 *.npz
+*.pt
+*.png
+*.jpeg
+*.gz
+\data

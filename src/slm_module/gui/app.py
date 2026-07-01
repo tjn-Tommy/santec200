@@ -13,6 +13,8 @@ from typing import Any, Callable
 import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
+import matplotlib
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from osa_module.controller import MeasurementSettings, OSAController
@@ -75,6 +77,29 @@ def _pattern_to_qimage(data: np.ndarray) -> QtGui.QImage:
     height, width = preview.shape
     image = QtGui.QImage(
         preview.data, width, height, width, QtGui.QImage.Format_Grayscale8
+    )
+    return image.copy()
+
+
+_CMAP_LUT = None
+
+
+def _cmap_lut() -> np.ndarray:
+    """Lazy 0..MAX_LEVEL -> RGB lookup table for the viridis colormap."""
+    global _CMAP_LUT
+    if _CMAP_LUT is None:
+        colours = matplotlib.colormaps["viridis"](np.linspace(0.0, 1.0, MAX_LEVEL + 1))
+        _CMAP_LUT = (colours[:, :3] * 255.0).astype(np.uint8)
+    return _CMAP_LUT
+
+
+def _pattern_to_qimage_color(data: np.ndarray) -> QtGui.QImage:
+    """Render a 0..1023 level grid as a colour (viridis) QImage."""
+    idx = np.clip(np.asarray(data), 0, MAX_LEVEL).astype(np.int32)
+    rgb = np.ascontiguousarray(_cmap_lut()[idx])          # H x W x 3, uint8
+    height, width = idx.shape
+    image = QtGui.QImage(
+        rgb.data, width, height, 3 * width, QtGui.QImage.Format_RGB888
     )
     return image.copy()
 
@@ -325,11 +350,17 @@ class SLMMonitorView(QtWidgets.QWidget):
         get_pattern: Callable[[], np.ndarray | None],
         describe: Callable[[], str | None],
         parent: QtWidgets.QWidget | None = None,
+        *,
+        image_min_height: int = 300,
+        profile_height: int = 200,
+        show_profile: bool = True,
     ):
         super().__init__(parent)
         self._get_pattern = get_pattern
         self._describe = describe
         self._last_shape: tuple[int, int] | None = None
+        self._show_profile = show_profile
+        self._preview = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -364,17 +395,22 @@ class SLMMonitorView(QtWidgets.QWidget):
         layout.addWidget(self.info_label)
 
         self.image_label = QtWidgets.QLabel()
-        self.image_label.setMinimumHeight(300)
+        self.image_label.setMinimumHeight(image_min_height)
         self.image_label.setAlignment(QtCore.Qt.AlignCenter)
         self.image_label.setObjectName("Preview")
         layout.addWidget(self.image_label, 1)
 
-        self.figure = Figure(figsize=(6, 2.2), tight_layout=True)
-        self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMaximumHeight(200)
-        self.axes = self.figure.add_subplot(111)
-        self._style_axes()
-        layout.addWidget(self.canvas)
+        if show_profile:
+            self.figure = Figure(figsize=(6, 2.2), tight_layout=True)
+            self.canvas = FigureCanvas(self.figure)
+            self.canvas.setMaximumHeight(profile_height)
+            self.axes = self.figure.add_subplot(111)
+            self._style_axes()
+            layout.addWidget(self.canvas)
+        else:
+            self.figure = None
+            self.canvas = None
+            self.axes = None
 
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self.refresh)
@@ -405,6 +441,11 @@ class SLMMonitorView(QtWidgets.QWidget):
         if self.live_check.isChecked():
             self._timer.start(int(value * 1000))
 
+    def set_preview(self, on: bool) -> None:
+        """Dim the view to signal an un-sent preview (vs. what's on the SLM)."""
+        self._preview = bool(on)
+        self.refresh()
+
     def refresh(self) -> None:
         pattern = None
         try:
@@ -427,20 +468,33 @@ class SLMMonitorView(QtWidgets.QWidget):
         height, width = pattern.shape
         unique = int(np.unique(pattern).size)
         prefix = f"{source}  ·  " if source else ""
+        preview_tag = "  ·  PREVIEW (not sent)" if self._preview else ""
         self.info_label.setText(
             f"{prefix}{width} x {height} px  ·  level "
-            f"{int(pattern.min())}–{int(pattern.max())}  ·  {unique} distinct"
+            f"{int(pattern.min())}–{int(pattern.max())}  ·  {unique} distinct{preview_tag}"
         )
 
-        image = _pattern_to_qimage(pattern)
+        image = _pattern_to_qimage_color(pattern)
         pixmap = QtGui.QPixmap.fromImage(image).scaled(
             self.image_label.size().expandedTo(QtCore.QSize(760, 280)),
             QtCore.Qt.KeepAspectRatio,
             QtCore.Qt.SmoothTransformation,
         )
+        if self._preview:
+            pixmap = self._dim_pixmap(pixmap)
         self.image_label.setPixmap(pixmap)
-        self._draw_profile(pattern)
+        if self._show_profile:
+            self._draw_profile(pattern)
         self._last_shape = (width, height)
+
+    @staticmethod
+    def _dim_pixmap(pixmap: QtGui.QPixmap) -> QtGui.QPixmap:
+        """Overlay a translucent dark veil to mark an un-sent preview."""
+        out = QtGui.QPixmap(pixmap)
+        painter = QtGui.QPainter(out)
+        painter.fillRect(out.rect(), QtGui.QColor(15, 20, 25, 150))
+        painter.end()
+        return out
 
     def _draw_profile(self, pattern: np.ndarray) -> None:
         profile = pattern.astype(np.float32).mean(axis=0)
@@ -470,7 +524,7 @@ class SLMMonitorView(QtWidgets.QWidget):
         )
         if not path:
             return
-        _pattern_to_qimage(pattern).save(path, "PNG")
+        _pattern_to_qimage_color(pattern).save(path, "PNG")
 
     def stop(self) -> None:
         self._timer.stop()
@@ -570,8 +624,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("\N{CHART WITH UPWARDS TREND}  Calibration", "Intensity, mod error, scope holding"),
             ("\N{LEFT RIGHT ARROW}  Center Scan", "Sweep a window across x"),
             ("\N{TRIGRAM FOR HEAVEN}  Phase Segments", "Piecewise phase along x"),
-            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding"),
-            ("\N{WATCH}  Scope Monitor", "Triggered per-event averaged readout"),
+            ("\N{HIGH VOLTAGE SIGN}  TPA Encoding", "Channel grid encoding + scope readout"),
         )
         for label, tooltip in nav_items:
             item = QtWidgets.QListWidgetItem(label)
@@ -587,7 +640,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self._build_scan_page())
         self.stack.addWidget(self._build_segments_page())
         self.stack.addWidget(self._build_tpa_page())
-        self.stack.addWidget(self._build_scope_monitor_page())
 
         layout.addWidget(sidebar)
         layout.addWidget(self.stack, 1)
@@ -1317,9 +1369,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_scan_page(self) -> QtWidgets.QWidget:
         page = self._page_shell("Center Scan")
 
-    def _build_scan_page(self) -> QtWidgets.QWidget:
-        page = self._page_shell("Center Scan")
-
         controls = self._panel("Pattern")
         form = QtWidgets.QGridLayout(controls)
         self.scan_level_spin = self._spin(0, 1023, 512)
@@ -1566,6 +1615,9 @@ class MainWindow(QtWidgets.QMainWindow):
         hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.Stretch)
         self.enc_val_table.verticalHeader().setVisible(False)
         self.enc_val_table.setAlternatingRowColors(True)
+        # keep at least ~3 data rows (plus header) visible even when the splitter
+        # is dragged small
+        self.enc_val_table.setMinimumHeight(170)
 
         val_buttons = QtWidgets.QHBoxLayout()
         enc_zeros = QtWidgets.QPushButton("All Zeros")
@@ -1612,28 +1664,49 @@ class MainWindow(QtWidgets.QMainWindow):
         ctrl_row.addWidget(self.enc_generate_button)
         ctrl_row.addWidget(self.enc_send_button)
 
-        # --- Colormap preview (matplotlib) ---
-        self.enc_figure = Figure(figsize=(10, 2.0), tight_layout=True)
-        self.enc_canvas = FigureCanvas(self.enc_figure)
-        self.enc_canvas.setMinimumHeight(150)
-        preview_panel = self._panel_with_widget("Pattern Preview", self.enc_canvas)
+        # --- live SLM pattern monitor (colour) replaces the static preview ---
+        # short-and-wide monitor: the pattern is already wide (1920x1200), so a
+        # low image band + a compact profile keeps most of the height for the
+        # channel-value table below
+        self.enc_monitor_view = SLMMonitorView(
+            get_pattern=lambda: self._encoding_pattern,
+            describe=lambda: "generated encoding pattern",
+            image_min_height=110,
+            show_profile=False,
+        )
+        monitor_panel = self._panel_with_widget("Pattern Monitor", self.enc_monitor_view)
 
-        # --- Feedback / hints log ---
+        left_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        left_split.addWidget(val_panel)
+        left_split.addWidget(monitor_panel)
+        left_split.setStretchFactor(0, 3)   # value table gets the bulk of the height
+        left_split.setStretchFactor(1, 1)
+        left_split.setSizes([460, 230])
+
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(left_split, 1)
+        left_layout.addLayout(ctrl_row)
+
+        # scope readout merged in at ~1/3 of the width
+        main_split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        main_split.addWidget(left)
+        main_split.addWidget(self._build_scope_monitor_widget())
+        main_split.setStretchFactor(0, 2)
+        main_split.setStretchFactor(1, 1)
+        main_split.setSizes([840, 420])
+
+        # --- single Feedback log for both SLM and scope, spanning full width ---
         self.enc_log = QtWidgets.QPlainTextEdit()
         self.enc_log.setReadOnly(True)
         self.enc_log.setObjectName("LogBox")
         self.enc_log.setMaximumHeight(120)
         log_panel = self._panel_with_widget("Feedback", self.enc_log)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        split.addWidget(val_panel)
-        split.addWidget(preview_panel)
-        split.addWidget(log_panel)
-        split.setSizes([300, 180, 110])
-
         page.layout().addWidget(cfg_panel)
-        page.layout().addWidget(split, 1)
-        page.layout().addLayout(ctrl_row)
+        page.layout().addWidget(main_split, 1)
+        page.layout().addWidget(log_panel)
 
         # auto-load the local calibration and build a default layout so the
         # value table is populated and ready for manual input immediately
@@ -1659,6 +1732,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """Append a timestamped hint/action line to the encoding feedback box."""
         stamp = time.strftime("%H:%M:%S")
         self.enc_log.appendPlainText(f"[{stamp}] {message}")
+
+    def _mon_status(self, message: str) -> None:
+        """Scope-monitor feedback shares the encoder's merged Feedback log."""
+        self._enc_log(f"[scope] {message}")
 
     def _enc_local_calib_path(self) -> Path | None:
         """Locate the project-local calibration result (calib_step3.json)."""
@@ -1869,59 +1946,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{int(pattern.min())}–{int(pattern.max())}). Open the SLM and click "
             "Send to SLM to display it."
         )
-        self._enc_draw_preview(pattern, layout)
-
-    def _enc_draw_preview(self, pattern: np.ndarray, layout: ChannelLayout) -> None:
-        self.enc_figure.clear()
-        ax = self.enc_figure.add_subplot(111)
-
-        # crop to active channel region + margin
-        x0 = max(0, min(ch.x_start for ch in layout.all_channels) - 30)
-        x1 = min(pattern.shape[1], max(ch.x_end for ch in layout.all_channels) + 30)
-        # show a thin horizontal slice so column structure is clear
-        mid = pattern.shape[0] // 2
-        crop = pattern[mid - 25 : mid + 25, x0:x1].astype(float)
-
-        im = ax.imshow(
-            crop,
-            aspect="auto",
-            cmap="viridis",
-            vmin=0,
-            vmax=1023,
-            extent=[x0, x1, 0, crop.shape[0]],
-            interpolation="nearest",
-        )
-
-        # centre dividing line
-        ax.axvline(layout.center_x, color="white", linewidth=1.0, linestyle="--", alpha=0.6)
-
-        # side labels
-        x_mid = (x0 + layout.center_x) / 2
-        w_mid = (layout.center_x + x1) / 2
-        ax.text(x_mid, crop.shape[0] * 0.85, "x channels (>778 nm)", color="white",
-                ha="center", fontsize=8, alpha=0.85)
-        ax.text(w_mid, crop.shape[0] * 0.85, "w channels (<778 nm)", color="white",
-                ha="center", fontsize=8, alpha=0.85)
-
-        # horizontal flip so the preview matches the OSA / physical orientation
-        # (wavelength increases left-to-right); data and labels stay correct
-        ax.invert_xaxis()
-
-        ax.set_xlabel("SLM x (px)", color="#d8dee9", fontsize=8)
-        ax.set_yticks([])
-        ax.tick_params(colors="#d8dee9", labelsize=8)
-        for spine in ax.spines.values():
-            spine.set_color("#41515c")
-
-        self.enc_figure.patch.set_facecolor("#101820")
-        ax.set_facecolor("#101820")
-
-        cbar = self.enc_figure.colorbar(im, ax=ax, orientation="vertical",
-                                        fraction=0.015, pad=0.01)
-        cbar.set_label("SLM level", color="#d8dee9", fontsize=8)
-        cbar.ax.tick_params(colors="#d8dee9", labelsize=7)
-
-        self.enc_canvas.draw_idle()
+        # dimmed preview: what's shown is generated but not yet on the SLM
+        self.enc_monitor_view.set_preview(True)
 
     def _enc_send(self) -> None:
         pattern = self._encoding_pattern
@@ -1949,8 +1975,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def done(_result: Any) -> None:
             self._enc_log("\N{CHECK MARK} Pattern received and displayed on the SLM.")
-            self.enc_send_button.setEnabled(True)
+            # pattern is now live on the SLM: clear the dim preview veil
+            self.enc_monitor_view.set_preview(False)
             _cleanup()
+            if self._enc_should_read_scope():
+                self._enc_read_scope_after_send()   # keeps Send disabled until read done
+            else:
+                self.enc_send_button.setEnabled(True)
 
         def failed(_error: str) -> None:
             self._enc_log("\N{CROSS MARK} Send failed (see the Status log on the Connections page).")
@@ -1962,6 +1993,46 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: controller.display_csv(tmp.name),
             done, failed,
         )
+
+    def _enc_should_read_scope(self) -> bool:
+        """Take a scope reading after a send only if it's safe/enabled."""
+        scope = self.scope_controller
+        return (
+            scope is not None and scope.is_connected
+            and self.mon_read_on_send.isChecked()
+            and self.monitor_stop_event is None   # not already running the trigger loop
+        )
+
+    def _enc_read_scope_after_send(self) -> None:
+        """Path C: after the pattern is displayed, wait the hold then read one
+        software-triggered averaged value and append it to the scope monitor."""
+        scope = self.scope_controller
+        # AUTO free-run with no armed edge: the SINGle self-triggers and completes
+        # right away (the earlier timeout was a stale ACQuire:COUNt, now forced to
+        # 1 in configure_monitor). This is the Path-C software read.
+        settings = self._monitor_settings(trigger_mode="AUTO")
+        self._mon_status("Reading scope after send…")
+
+        def work() -> MonitorSample | None:
+            scope.configure_monitor(settings)
+            time.sleep(settings.hold)             # settle after the SLM pattern change
+            return scope.monitor_cycle(
+                index=len(self._monitor_values),
+                timeout=max(30.0, settings.duration * 3.0 + 10.0),
+            )
+
+        def ok(sample: MonitorSample | None) -> None:
+            if sample is not None:
+                self._on_monitor_sample(sample)
+            else:
+                self._mon_status("Scope read returned nothing.")
+            self.enc_send_button.setEnabled(True)
+
+        def err(_error: str) -> None:
+            self._mon_status("Scope read failed (see Status log).")
+            self.enc_send_button.setEnabled(True)
+
+        self._run_task("Scope read on send", work, ok, err)
 
     # ==================================================================
     # Modulation Error Analysis page (B1: single-channel spectral shape)
@@ -2326,107 +2397,69 @@ class MainWindow(QtWidgets.QMainWindow):
     _TRIG_SOURCES = [("CH1", "CHANnel1"), ("CH2", "CHANnel2"), ("CH3", "CHANnel3"),
                      ("CH4", "CHANnel4"), ("EXT", "EXTernanalog")]
 
-    def _build_scope_monitor_page(self) -> QtWidgets.QWidget:
-        page = self._page_shell("Scope Monitor · Triggered Readout")
-        subtitle = QtWidgets.QLabel(
-            "For each SLM trigger (rising edge): wait the hold time, then have "
-            "the scope average ch over the window and return one value. Connect "
-            "the scope on the Scope page first. The mean is computed on-scope, so "
-            "no waveform is transferred per trigger."
-        )
-        subtitle.setObjectName("PageSubtitle")
-        subtitle.setWordWrap(True)
-        page.layout().addWidget(subtitle)
+    def _build_scope_monitor_widget(self) -> QtWidgets.QWidget:
+        """Embeddable triggered scope readout (lives inside the TPA encoder page)."""
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
 
-        cfg = self._panel("Trigger & averaging")
+        cfg = self._panel("Scope Monitor · trigger & averaging")
         grid = QtWidgets.QGridLayout(cfg)
-        self.mon_channel = QtWidgets.QComboBox()
-        self.mon_channel.addItems(["1", "2", "3", "4"])
+        self.mon_channel = QtWidgets.QComboBox(); self.mon_channel.addItems(["1", "2", "3", "4"])
         self.mon_trig_source = QtWidgets.QComboBox()
         for label, _tok in self._TRIG_SOURCES:
             self.mon_trig_source.addItem(label)
-        self.mon_trig_source.setCurrentIndex(2)  # CH3 as a sensible default
+        self.mon_trig_source.setCurrentIndex(2)
         self.mon_trig_level = QtWidgets.QDoubleSpinBox()
-        self.mon_trig_level.setRange(-5.0, 5.0)
-        self.mon_trig_level.setSingleStep(0.1)
-        self.mon_trig_level.setValue(1.5)
-        self.mon_trig_level.setSuffix(" V")
-        self.mon_trig_level.setToolTip("Mid-level of the 0–3 V SLM pulse; rising edge")
+        self.mon_trig_level.setRange(-5.0, 5.0); self.mon_trig_level.setSingleStep(0.1)
+        self.mon_trig_level.setValue(1.5); self.mon_trig_level.setSuffix(" V")
         self.mon_hold = QtWidgets.QDoubleSpinBox()
-        self.mon_hold.setRange(0.0, 10000.0)
-        self.mon_hold.setValue(100.0)
-        self.mon_hold.setSuffix(" ms")
-        self.mon_hold.setToolTip("Settle time after the trigger before averaging")
+        self.mon_hold.setRange(0.0, 10000.0); self.mon_hold.setValue(100.0); self.mon_hold.setSuffix(" ms")
         self.mon_duration = QtWidgets.QDoubleSpinBox()
-        self.mon_duration.setRange(0.001, 10.0)
-        self.mon_duration.setDecimals(3)
-        self.mon_duration.setValue(1.0)
-        self.mon_duration.setSuffix(" s")
-        self.mon_duration.setToolTip("Averaging window length (MEAN gate)")
-        self.mon_decimation = QtWidgets.QComboBox()
-        self.mon_decimation.addItems(["HRESolution", "SAMPle"])
-        self.mon_bandwidth = QtWidgets.QComboBox()
-        self.mon_bandwidth.addItems(["(keep)", "FULL", "B800", "B200", "B20"])
-        self.mon_digfilter = QtWidgets.QLineEdit("")
-        self.mon_digfilter.setPlaceholderText("off")
-        self.mon_digfilter.setToolTip("Digital low-pass cutoff in Hz (blank = off)")
-        grid.addWidget(QtWidgets.QLabel("Channel"), 0, 0)
-        grid.addWidget(self.mon_channel, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Trigger src"), 0, 2)
-        grid.addWidget(self.mon_trig_source, 0, 3)
-        grid.addWidget(QtWidgets.QLabel("Trigger level"), 0, 4)
-        grid.addWidget(self.mon_trig_level, 0, 5)
-        grid.addWidget(QtWidgets.QLabel("Hold"), 1, 0)
-        grid.addWidget(self.mon_hold, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Average for"), 1, 2)
-        grid.addWidget(self.mon_duration, 1, 3)
-        grid.addWidget(QtWidgets.QLabel("Decimation"), 1, 4)
-        grid.addWidget(self.mon_decimation, 1, 5)
-        grid.addWidget(QtWidgets.QLabel("BW limit"), 2, 0)
-        grid.addWidget(self.mon_bandwidth, 2, 1)
-        grid.addWidget(QtWidgets.QLabel("Digital LP (Hz)"), 2, 2)
-        grid.addWidget(self.mon_digfilter, 2, 3)
-        page.layout().addWidget(cfg)
+        self.mon_duration.setRange(0.001, 10.0); self.mon_duration.setDecimals(3)
+        self.mon_duration.setValue(1.0); self.mon_duration.setSuffix(" s")
+        self.mon_decimation = QtWidgets.QComboBox(); self.mon_decimation.addItems(["HRESolution", "SAMPle"])
+        self.mon_bandwidth = QtWidgets.QComboBox(); self.mon_bandwidth.addItems(["(keep)", "FULL", "B800", "B200", "B20"])
+        self.mon_digfilter = QtWidgets.QLineEdit(""); self.mon_digfilter.setPlaceholderText("off")
+        pairs = [("Channel", self.mon_channel), ("Trigger src", self.mon_trig_source),
+                 ("Level", self.mon_trig_level), ("Hold", self.mon_hold),
+                 ("Average for", self.mon_duration), ("Decimation", self.mon_decimation),
+                 ("BW limit", self.mon_bandwidth), ("Digital LP", self.mon_digfilter)]
+        for i, (label, widget) in enumerate(pairs):
+            r, c = i // 2, (i % 2) * 2
+            grid.addWidget(QtWidgets.QLabel(label), r, c)
+            grid.addWidget(widget, r, c + 1)
+        v.addWidget(cfg)
 
-        # live value readout
-        self.mon_value_label = QtWidgets.QLabel("—")
-        self.mon_value_label.setObjectName("PageTitle")
-        self.mon_value_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.mon_count_label = QtWidgets.QLabel("0 readings")
+        self.mon_count_label = QtWidgets.QLabel("0 patterns")
         self.mon_count_label.setObjectName("PageSubtitle")
         self.mon_count_label.setAlignment(QtCore.Qt.AlignCenter)
-        readout = QtWidgets.QVBoxLayout()
-        readout.addWidget(self.mon_value_label)
-        readout.addWidget(self.mon_count_label)
-        page.layout().addLayout(readout)
+        v.addWidget(self.mon_count_label)
 
-        self.mon_fig = Figure(figsize=(7, 3.0), tight_layout=True)
+        self.mon_fig = Figure(figsize=(4, 2.4), tight_layout=True)
         self.mon_canvas = FigureCanvas(self.mon_fig)
-        page.layout().addWidget(self._panel_with_widget("Value per trigger", self.mon_canvas), 1)
+        v.addWidget(self._panel_with_widget("Average per pattern", self.mon_canvas), 1)
 
-        self.mon_status = QtWidgets.QLabel("\N{EN DASH}")
-        self.mon_start_button = QtWidgets.QPushButton("Start Monitor")
-        self.mon_start_button.clicked.connect(self._monitor_start)
-        self.mon_stop_button = QtWidgets.QPushButton("Stop")
-        self.mon_stop_button.setProperty("variant", "danger")
-        self.mon_stop_button.setEnabled(False)
-        self.mon_stop_button.clicked.connect(self._monitor_stop)
+        # This readout is a behaviour recorder, not a live monitor: each pattern
+        # you send appends one (pattern #, average) point via auto-read-on-send.
         self.mon_clear_button = QtWidgets.QPushButton("Clear")
         self.mon_clear_button.setProperty("variant", "ghost")
         self.mon_clear_button.clicked.connect(self._monitor_clear)
         self.mon_save_button = QtWidgets.QPushButton("Save CSV…")
         self.mon_save_button.setProperty("variant", "ghost")
         self.mon_save_button.clicked.connect(self._monitor_save)
-        ctrl = QtWidgets.QHBoxLayout()
-        ctrl.addWidget(self.mon_status, 1)
-        ctrl.addWidget(self.mon_clear_button)
-        ctrl.addWidget(self.mon_save_button)
-        ctrl.addWidget(self.mon_start_button)
-        ctrl.addWidget(self.mon_stop_button)
-        page.layout().addLayout(ctrl)
-        return page
+        self.mon_read_on_send = QtWidgets.QCheckBox("Auto-read on SLM send")
+        self.mon_read_on_send.setChecked(True)
+        self.mon_read_on_send.setToolTip(
+            "After a pattern is sent from this page, take one free-run averaged "
+            "scope reading and append it to the record."
+        )
+        v.addWidget(self.mon_read_on_send)
+        row = QtWidgets.QHBoxLayout(); row.addWidget(self.mon_clear_button); row.addWidget(self.mon_save_button)
+        v.addLayout(row)
+        return w
 
-    def _monitor_settings(self) -> MonitorSettings:
+    def _monitor_settings(self, trigger_mode: str = "NORMal") -> MonitorSettings:
         cutoff_text = self.mon_digfilter.text().strip()
         try:
             cutoff = float(cutoff_text) if cutoff_text else None
@@ -2435,6 +2468,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bw = self.mon_bandwidth.currentText()
         return MonitorSettings(
             channel=int(self.mon_channel.currentText()),
+            trigger_mode=trigger_mode,
             trigger_source=self._TRIG_SOURCES[self.mon_trig_source.currentIndex()][1],
             trigger_level=self.mon_trig_level.value(),
             trigger_slope="POSitive",
@@ -2445,47 +2479,10 @@ class MainWindow(QtWidgets.QMainWindow):
             digital_filter_cutoff=cutoff,
         )
 
-    def _monitor_set_running(self, running: bool) -> None:
-        self.mon_start_button.setEnabled(not running)
-        self.mon_stop_button.setEnabled(running)
-        self.mon_clear_button.setEnabled(not running)
-
-    def _monitor_start(self) -> None:
-        scope = self.scope_controller
-        if scope is None or not scope.is_connected:
-            self.mon_status.setText("Connect the scope on the Scope page first.")
-            return
-        settings = self._monitor_settings()
-        stop_event = threading.Event()
-        self.monitor_stop_event = stop_event
-        self.mon_status.setText("Waiting for trigger…")
-        self._monitor_set_running(True)
-
-        def work() -> dict[str, Any]:
-            scope.configure_monitor(settings)
-            n = 0
-            while not stop_event.is_set():
-                sample = scope.monitor_cycle(
-                    index=n, timeout=600.0, poll_interval=0.05, stop_event=stop_event
-                )
-                if sample is None:
-                    break
-                self.monitor_sample.emit(sample)
-                n += 1
-            return {"count": n}
-
-        self._run_task("Scope monitor", work, self._monitor_finished, self._monitor_error)
-
-    def _monitor_stop(self) -> None:
-        if self.monitor_stop_event is not None:
-            self.monitor_stop_event.set()
-            self.mon_status.setText("Stopping…")
-
     def _on_monitor_sample(self, sample: MonitorSample) -> None:
         self._monitor_values.append(sample.value)
-        self.mon_value_label.setText(f"{sample.value*1000:.4f} mV")
-        self.mon_count_label.setText(f"{len(self._monitor_values)} readings")
-        self.mon_status.setText(f"#{sample.index + 1} · waiting for next trigger…")
+        self.mon_count_label.setText(f"{len(self._monitor_values)} patterns")
+        self._mon_status(f"pattern #{len(self._monitor_values)}: {sample.value*1000:.4f} mV")
         self._monitor_draw()
 
     def _monitor_draw(self) -> None:
@@ -2493,45 +2490,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mon_fig.patch.set_facecolor("#101820")
         ax = self.mon_fig.add_subplot(111)
         self._style_dark_axes(ax)
-        ax.set_xlabel("Trigger #")
-        ax.set_ylabel("Mean (V)")
+        ax.set_xlabel("Pattern # (send order)")
+        ax.set_ylabel("Average (mV)")
         if self._monitor_values:
-            ax.plot(range(1, len(self._monitor_values) + 1), self._monitor_values,
+            n = len(self._monitor_values)
+            xs = range(1, n + 1)
+            ax.plot(xs, [v * 1000 for v in self._monitor_values],
                     marker="o", ms=3, color="#47b8e0", linewidth=0.8)
+            # integer-only ticks on the pattern axis (1, 2, 3, …)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            ax.set_xlim(0.5, n + 0.5)
         self.mon_canvas.draw_idle()
-
-    def _monitor_finished(self, payload: dict[str, Any]) -> None:
-        self.monitor_stop_event = None
-        self._monitor_set_running(False)
-        self.mon_status.setText(f"Stopped · {payload.get('count', 0)} readings")
-
-    def _monitor_error(self, _error: str) -> None:
-        self.monitor_stop_event = None
-        self._monitor_set_running(False)
-        self.mon_status.setText("Monitor failed (see Status log) — check trigger/connection")
 
     def _monitor_clear(self) -> None:
         self._monitor_values = []
-        self.mon_value_label.setText("—")
-        self.mon_count_label.setText("0 readings")
+        self.mon_count_label.setText("0 patterns")
         self._monitor_draw()
 
     def _monitor_save(self) -> None:
         if not self._monitor_values:
-            self.mon_status.setText("No readings to save.")
+            self._mon_status("No readings to save.")
             return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Save monitor readings", "scope_monitor.csv", "CSV (*.csv)")
+            self, "Save pattern readings", "scope_readings.csv", "CSV (*.csv)")
         if not path:
             return
         import csv as _csv
 
         with open(path, "w", encoding="utf-8", newline="") as f:
             writer = _csv.writer(f)
-            writer.writerow(["trigger", "mean_V"])
+            writer.writerow(["pattern", "mean_V"])
             for i, v in enumerate(self._monitor_values, start=1):
                 writer.writerow([i, v])
-        self._log(f"Monitor readings saved: {path}")
+        self._log(f"Pattern readings saved: {path}")
 
     def _page_shell(self, title: str) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -3864,6 +3855,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if hasattr(self, "slm_monitor_view"):
             self.slm_monitor_view.stop()
+        if hasattr(self, "enc_monitor_view"):
+            self.enc_monitor_view.stop()
         if self.keepalive is not None:
             self.keepalive.stop()
             self.keepalive = None
